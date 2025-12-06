@@ -7,7 +7,7 @@
 * **Orchestration:** LangGraph (State Machines, Supervisor Pattern).
 * **Vector Database:** Qdrant (Docker) or Chroma (Local) for dynamic CRUD operations.
 * **Persistence:** SQLite (for Human-in-the-Loop state management).
-* **LLM:** Mistral/Llama (via Ollama) or OpenAI.
+* **LLM:** Mistral/Llama/Gemini (via Ollama).
 
 ---
 
