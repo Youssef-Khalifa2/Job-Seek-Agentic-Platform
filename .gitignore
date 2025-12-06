@@ -1,1 +1,4 @@
 config.py
+/qdrant_data
+/venv
+/cvs
