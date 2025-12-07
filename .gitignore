@@ -2,3 +2,5 @@ config.py
 /qdrant_data
 /venv
 /cvs
+*.pyc
+*.ipynb
