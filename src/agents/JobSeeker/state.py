@@ -44,3 +44,4 @@ class AgentState(TypedDict):
     max_editor_retries: int  # Default e.g. 2
     unresolved_critiques: List[Dict[str, Any]]  # Critiques the editor failed to fix
     verification_result: Optional[Dict[str, Any]]
+    retry_guidance: Optional[str]  # Summary of what verifier wants editor to focus on

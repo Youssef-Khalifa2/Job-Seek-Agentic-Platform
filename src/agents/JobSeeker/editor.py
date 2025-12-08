@@ -29,33 +29,45 @@ Return ONLY the full, rewritten CV text (Markdown format).
 def editor_node(state: AgentState):
     """
     Pure execution node. Applies the pre-validated critiques.
+    On retry: Also considers verifier's focused guidance.
     """
     critiques = state.get("actionable_critiques", [])
-    
+    retry_guidance = state.get("retry_guidance")
+    retry_count = state.get("editor_retry_count", 0)
+
     if not critiques:
         print("  😴 Editor has no critiques to apply. Skipping.")
         return {
             "revision_count": state["revision_count"] + 1
         }
 
-    print(f"✍️ Editor applying {len(critiques)} verified critiques...")
-    
+    if retry_count > 0:
+        print(f"✍️ Editor RETRY #{retry_count}: Applying {len(critiques)} critiques with focused guidance...")
+    else:
+        print(f"✍️ Editor applying {len(critiques)} verified critiques...")
+
     # 1. Format instructions
     feedback_str = ""
     for c in critiques:
         feedback_str += f"- {c.summary} (Reasoning: {c.reasoning})\n"
-    
-    # 2. Execute
+
+    # 2. Add retry guidance if this is a retry
+    if retry_guidance:
+        feedback_str += f"\n**VERIFIER FEEDBACK (Focus on these):**\n{retry_guidance}\n"
+        print("  ⚠️ Including verifier's focused guidance in prompt")
+
+    # 3. Execute
     msg = editor_prompt.invoke({
         "resume_text": state["resume_text"],
         "critiques_list": feedback_str
     })
-    
+
     response = llm.invoke(msg)
     filtered_content = filter_reasoning(response)
 
     return {
-        "resume_text": filtered_content,          
+        "resume_text": filtered_content,
         "revision_count": state["revision_count"] + 1,
-        "actionable_critiques": [] # Clear queue after applying
+        "actionable_critiques": [],  # Clear queue after applying
+        "retry_guidance": None  # Clear retry guidance after using it
     }

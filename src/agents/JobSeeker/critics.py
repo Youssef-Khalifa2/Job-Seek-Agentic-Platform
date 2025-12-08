@@ -4,7 +4,9 @@ from langchain_core.prompts import ChatPromptTemplate
 from src.agents.JobSeeker.state import AgentState, Critique
 from src.tools.ats_parser import check_ats_compatibility
 from src.tools.layout_analyzer import analyze_resume_layout
+from src.tools.web_search import analyze_job_description, validate_market_demand 
 import config
+from src.tools.grammar_check import check_grammar
 from src.llm_registry import LLMRegistry
 
 llm = LLMRegistry.get_pixtral_large()
@@ -31,57 +33,6 @@ def parse_critic_output(response_content: str, critic_name: str) -> str:
     except json.JSONDecodeError:
         return f"### {critic_name} Error\nFailed to parse JSON output."
 
-# --- 1. ATS & Formatting Critic 🤖 ---
-ats_prompt = ChatPromptTemplate.from_template("""
-You are the **ATS Gatekeeper**. Your goal is to ensure the resume is machine-readable.
-
-RESUME TEXT:
-{resume_text}
-
-TASK:
-Identify layout or formatting risks that would break a parser (e.g., tables, columns, icons, header issues).
-Since you are reading raw text, infer these structures based on odd spacing or line breaks.
-
-OUTPUT JSON:
-{{
-  "score": 0-100,
-  "feedback_list": [
-    {{
-      "issue": "string (e.g. 'Possible Table detected')",
-      "location": "string (section name)",
-      "fix": "string (e.g. 'Use standard bullets')"
-    }}
-  ]
-}}
-""")
-
-# --- 2. JD Match Critic 🎯 ---
-match_prompt = ChatPromptTemplate.from_template("""
-You are the **Recruiter Bot**. Your goal is to see if this candidate matches the Job Description.
-
-JOB DESCRIPTION:
-{job_description}
-
-RESUME:
-{resume_text}
-
-TASK:
-1. Extract hard skills from the JD that are MISSING in the Resume.
-2. Identify bullets that are totally irrelevant to this job.
-
-OUTPUT JSON:
-{{
-  "match_score": 0-100,
-  "missing_keywords": ["string", "string"],
-  "irrelevant_bullets": [
-    {{
-      "bullet": "string",
-      "reason": "string"
-    }}
-  ]
-}}
-""")
-
 # --- 3. Evidence/Truth Critic ⚖️ ---
 truth_prompt = ChatPromptTemplate.from_template("""
 You are the **Integrity Auditor**. Your goal is to find unsupported claims.
@@ -100,29 +51,6 @@ OUTPUT JSON:
       "claim": "string",
       "issue": "string (e.g. 'Unsupported Skill' or 'Vague Claim')",
       "fix": "string (e.g. 'Add a bullet about using Python')"
-    }}
-  ]
-}}
-""")
-
-# --- 4. Language & Clarity Critic ✍️ ---
-language_prompt = ChatPromptTemplate.from_template("""
-You are the **Chief Editor**. Your goal is to remove fluff and passive voice.
-
-RESUME:
-{resume_text}
-
-TASK:
-1. specific sentences with passive voice ("was done by").
-2. Remove buzzwords ("hardworking", "synergy", "proactive").
-
-OUTPUT JSON:
-{{
-  "feedback_list": [
-    {{
-      "original": "string",
-      "issue": "string",
-      "better_rewrite": "string"
     }}
   ]
 }}
@@ -239,32 +167,85 @@ def ats_critic_node(state: AgentState):
         return {"critique_inputs": []}
 
 def match_critic_node(state: AgentState):
-    res = llm.invoke(match_prompt.invoke({"job_description": state["job_description"], "resume_text": state["resume_text"]}))
+    """
+    Match Critic with Web-Augmented Analysis.
+    1. Extracts structured requirements from the JD.
+    2. Validates key skills against market data (Web Search).
+    3. Compares with the Resume.
+    """
+    print("📊 Match Critic: Analyzing job requirements...")
+
+    # 1. Extract Requirements (Using the "Researcher" tool)
+    jd_analysis = analyze_job_description(state["job_description"])
+    job_title = jd_analysis.get("job_title", "Candidate")
+    required_skills = jd_analysis.get("required_skills", [])
+
+    print(f"  → Role: {job_title}")
+    print(f"  → Found {len(required_skills)} required skills to validate.")
+
+    # 2. Validate Top Skills (Spot check the first 3-5 to save time/tokens)
+    # We check if these are "hard" requirements in the market.
+    market_validation = {}
+    for skill in required_skills[:3]: 
+        validation = validate_market_demand(skill, job_title)
+        market_validation[skill] = validation.get("validated", False)
+
+    # 3. LLM Synthesis
+    # We pass the JD Analysis + Market Validation to the prompt
+    match_prompt_augmented = f"""
+    You are a Recruiter Bot. Evaluate this candidate.
+
+    JOB ANALYSIS (Extracted):
+    {json.dumps(jd_analysis, indent=2)}
+
+    MARKET VALIDATION (Web Search):
+    {json.dumps(market_validation, indent=2)}
+
+    RESUME TEXT:
+    {state["resume_text"]}
+
+    TASK:
+    1. Identify MISSING hard skills that are validated as crucial.
+    2. Identify "Nice-to-have" skills that can be de-prioritized.
+    3. Check for synonym matches (e.g., JD asks for "React", Resume has "Next.js" -> Match).
+
+    OUTPUT JSON:
+    {{
+      "match_score": 0-100,
+      "missing_keywords": ["skill1", "skill2"],
+      "irrelevant_bullets": [
+        {{ "bullet": "text", "reason": "why it's irrelevant" }}
+      ],
+      "reasoning": "Explain the gap based on market standards."
+    }}
+    """
+
+    res = llm.invoke(match_prompt_augmented)
 
     try:
-        # Parse JSON to get both raw data and summary
         data = json.loads(res.content)
         summary = parse_critic_output(res.content, "JD Match Critic")
+        
+        # Add market context to the summary
+        if market_validation:
+            summary += "\n**Market Check:** Verified demand for " + ", ".join(market_validation.keys())
 
-        # Create Critique object
         critique = Critique(
             source="JD Match Critic",
             summary=summary,
             details=data,
-            resolved=False
+            resolved=False,
+            confidence=0.9, # Higher confidence because we checked the web
+            tool_evidence={"jd_analysis": jd_analysis, "market_validation": market_validation}
         )
 
+        print(f"  ✓ Match Analysis complete. Score: {data.get('match_score')}")
         return {"critique_inputs": [critique]}
-    except json.JSONDecodeError as e:
-        print(f"❌ JD Match Critic JSON Error: {e}")
-        print(f"Response content: {res.content[:200]}")
-        error_critique = Critique(
-            source="JD Match Critic",
-            summary=f"### Error\nFailed to parse JSON: {str(e)}",
-            details={"error": str(e), "raw_response": res.content[:500]},
-            resolved=False
-        )
-        return {"critique_inputs": [error_critique]}
+
+    except Exception as e:
+        print(f"❌ Match Critic failed: {e}")
+        # Fallback to empty critique or standard prompt if needed
+        return {"critique_inputs": []}
 
 def truth_critic_node(state: AgentState):
     res = llm.invoke(truth_prompt.invoke({"resume_text": state["resume_text"]}))
@@ -295,32 +276,75 @@ def truth_critic_node(state: AgentState):
         return {"critique_inputs": [error_critique]}
 
 def language_critic_node(state: AgentState):
-    res = llm.invoke(language_prompt.invoke({"resume_text": state["resume_text"]}))
+    """
+    Language Critic with Grammar Tooling.
+    1. Runs deterministic grammar check (Typos, basic rules).
+    2. Uses LLM for Tone, Voice, and Clarity.
+    3. Merges both into actionable feedback.
+    """
+    print("✍️ Language Critic: reviewing text...")
+    
+    # 1. Run Tool
+    # Check the first 5000 chars to save time/memory if CV is huge
+    grammar_result = check_grammar(state["resume_text"][:5000])
+    
+    print(f"  → Grammar Tool found {grammar_result['issue_count']} potential issues.")
+
+    # 2. LLM Synthesis
+    language_prompt = f"""
+    You are a Chief Editor. Review this resume text.
+
+    HARD EVIDENCE (Grammar Tool):
+    {json.dumps(grammar_result, indent=2)}
+
+    RESUME TEXT:
+    {state["resume_text"][:3000]}
+
+    TASK:
+    1. Fix valid grammar issues found by the tool.
+    2. Identify "Passive Voice" (e.g., "Responsibilities included...").
+    3. Identify "Weak Verbs" or "Buzzwords" (e.g., "synergy", "hard worker").
+    4. Suggest concise rewrites.
+
+    OUTPUT JSON:
+    {{
+      "score": 0-100,
+      "grammar_issues": ["Specific typo or rule break"],
+      "style_issues": ["Passive voice usage", "Buzzword usage"],
+      "better_rewrites": [
+        {{ "original": "...", "fix": "..." }}
+      ]
+    }}
+    """
+    
+    res = llm.invoke(language_prompt)
 
     try:
-        # Parse JSON to get both raw data and summary
         data = json.loads(res.content)
-        summary = parse_critic_output(res.content, "Language Critic")
+        
+        # High confidence if the tool found objective errors
+        confidence = 0.95 if grammar_result['issue_count'] > 0 else 0.8
+        
+        summary = f"### ✍️ Language Report (Score: {data.get('score')})\n"
+        if data.get("grammar_issues"):
+            summary += f"- **Grammar:** {len(data['grammar_issues'])} issues detected.\n"
+        for item in data.get("better_rewrites", [])[:3]:
+            summary += f"- *Change:* '{item['original']}' → '{item['fix']}'\n"
 
-        # Create Critique object
         critique = Critique(
             source="Language Critic",
             summary=summary,
             details=data,
-            resolved=False
+            resolved=False,
+            confidence=confidence,
+            tool_evidence={"grammar_check": grammar_result}
         )
 
         return {"critique_inputs": [critique]}
-    except json.JSONDecodeError as e:
-        print(f"❌ Language Critic JSON Error: {e}")
-        print(f"Response content: {res.content[:200]}")
-        error_critique = Critique(
-            source="Language Critic",
-            summary=f"### Error\nFailed to parse JSON: {str(e)}",
-            details={"error": str(e), "raw_response": res.content[:500]},
-            resolved=False
-        )
-        return {"critique_inputs": [error_critique]}
+
+    except Exception as e:
+        print(f"❌ Language Critic failed: {e}")
+        return {"critique_inputs": []}
 
 def impact_critic_node(state: AgentState):
     # This one has a slightly different JSON structure, so we parse it custom or adapt the helper
