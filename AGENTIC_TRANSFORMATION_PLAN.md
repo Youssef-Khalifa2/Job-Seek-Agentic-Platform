@@ -123,7 +123,8 @@ class AgentState(TypedDict):
     resolved_critique_ids: Set[str]
     revision_count: int
     job_description: Optional[str]
-    resume_text: Optional[str]
+    resume_text: Optional[str]  # Extracted text for text-based analysis
+    original_pdf_path: Optional[str]  # NEW: Path to original PDF for VLM analysis
     actionable_critiques: List[Critique]
 
     # NEW: Quality tracking
@@ -133,6 +134,26 @@ class AgentState(TypedDict):
     # NEW: Tool outputs
     ats_parser_result: Optional[Dict[str, Any]]
     layout_analysis: Optional[Dict[str, Any]]
+
+    # NEW: Verification & Retry logic
+    editor_retry_count: int  # Track editor retries per iteration (default 0)
+    max_editor_retries: int  # Maximum retries allowed (default 2)
+    unresolved_critiques: List[Dict[str, Any]]  # Critiques that weren't fixed
+    verification_result: Optional[Dict[str, Any]]  # Verifier output
+```
+
+**Update ingestion to pass original PDF path:**
+```python
+# In test.py or main.py
+initial_state = {
+    "resume_text": extract_text_from_pdf(pdf_path),  # For text analysis
+    "original_pdf_path": pdf_path,  # For VLM analysis
+    "job_description": job_desc,
+    "revision_count": 0,
+    "editor_retry_count": 0,
+    "max_editor_retries": 2,
+    # ... rest of fields
+}
 ```
 
 **Step 0.2: Create Model Registry** (30 min)
@@ -351,8 +372,8 @@ def supervisor_node(state: AgentState) -> Command[Literal["critics_start", "__en
             improvement = current_score - quality_scores[-2]
             print(f"  📈 Improvement: {improvement:+.1f} points")
 
-            # Stop if diminishing returns (< 3 points improvement)
-            if improvement < 3.0:
+            # Stop if diminishing returns (< 5 points improvement)
+            if improvement < 5.0:
                 print("  🛑 Diminishing returns detected. Stopping.")
                 return Command(goto="__end__")
 
@@ -478,111 +499,130 @@ def check_ats_compatibility(resume_text: str) -> Dict[str, Any]:
 
 **Problem**: Can't detect visual issues (columns, icons, tables) from text alone.
 
-**Solution**: Use Pixtral Large (FREE Mistral vision model, December 2025) to analyze visual layout.
+**Solution**: Use Pixtral Large (FREE Mistral vision model) to analyze ORIGINAL PDF layout.
 
 File: `src/tools/layout_analyzer.py` (NEW)
 
 ```python
 from langchain_core.messages import HumanMessage
 from src.llm_registry import LLMRegistry
+from pdf2image import convert_from_path
 import base64
 from io import BytesIO
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter
+from typing import List
+import json
 
 class LayoutAnalyzer:
     """
-    Uses Vision Language Model (Pixtral Large) to analyze resume visual layout.
-    Pixtral Large is FREE on Mistral AI platform and optimized for document analysis.
+    Uses Vision Language Model (Pixtral Large) to analyze ORIGINAL PDF layout.
+    Converts the actual uploaded PDF to images to preserve all visual formatting.
     """
 
     def __init__(self):
         # Use Pixtral Large - FREE vision model with 128K context
         self.vlm = LLMRegistry.get_pixtral_large()
 
-    def text_to_pdf_image(self, text: str) -> str:
+    def pdf_to_images(self, pdf_path: str) -> List[str]:
         """
-        Convert text to PDF, then to base64 image for VLM analysis.
-        Returns base64 encoded image string.
+        Convert ORIGINAL PDF pages to base64-encoded PNG images.
+        Preserves actual layout, columns, tables, icons, etc.
+
+        Args:
+            pdf_path: Path to the original uploaded PDF file
+
+        Returns:
+            List of base64-encoded PNG images (one per page)
         """
-        # Create simple PDF from text
-        buffer = BytesIO()
-        pdf = canvas.Canvas(buffer, pagesize=letter)
-
-        # Write text to PDF (simple layout)
-        y = 750
-        for line in text.split('\n')[:40]:  # First 40 lines
-            pdf.drawString(50, y, line[:80])  # Truncate long lines
-            y -= 15
-            if y < 50:
-                break
-
-        pdf.save()
-        buffer.seek(0)
-
-        # Convert to base64
-        pdf_bytes = buffer.read()
-        return base64.b64encode(pdf_bytes).decode('utf-8')
-
-    def analyze_layout(self, resume_text: str) -> dict:
-        """
-        Analyze visual layout using VLM.
-        """
-        # Convert to image
-        image_data = self.text_to_pdf_image(resume_text)
-
-        # Create vision prompt
-        message = HumanMessage(
-            content=[
-                {
-                    "type": "text",
-                    "text": """
-                    Analyze this resume's visual layout for ATS compatibility.
-
-                    Check for:
-                    1. Multiple columns (ATS can't parse columns)
-                    2. Tables or grids
-                    3. Icons or graphics
-                    4. Unusual fonts or formatting
-                    5. Text boxes or sidebars
-
-                    Return JSON:
-                    {
-                      "has_columns": bool,
-                      "has_tables": bool,
-                      "has_icons": bool,
-                      "layout_issues": ["issue1", "issue2"],
-                      "overall_assessment": "ATS-friendly" or "ATS-unfriendly"
-                    }
-                    """
-                },
-                {
-                    "type": "image_url",
-                    "image_url": f"data:application/pdf;base64,{image_data}"
-                }
-            ]
+        # Convert PDF to images (preserves actual layout)
+        images = convert_from_path(
+            pdf_path,
+            first_page=1,
+            last_page=2,  # Analyze first 2 pages
+            dpi=150  # Good balance of quality vs size
         )
 
+        base64_images = []
+        for img in images:
+            buffer = BytesIO()
+            img.save(buffer, format='PNG')
+            buffer.seek(0)
+            base64_images.append(base64.b64encode(buffer.read()).decode('utf-8'))
+
+        return base64_images
+
+    def analyze_layout(self, pdf_path: str) -> dict:
+        """
+        Analyze ORIGINAL PDF visual layout using VLM.
+
+        Args:
+            pdf_path: Path to the ORIGINAL uploaded PDF file (from state)
+        """
         try:
+            # Convert original PDF to images
+            images = self.pdf_to_images(pdf_path)
+
+            # Analyze first page with VLM
+            message = HumanMessage(
+                content=[
+                    {
+                        "type": "text",
+                        "text": """
+                        Analyze this resume's ACTUAL visual layout for ATS compatibility.
+
+                        Check for:
+                        1. Multiple columns (ATS can't parse columns properly)
+                        2. Tables or grids (can confuse ATS parsers)
+                        3. Icons, graphics, or images
+                        4. Unusual fonts or decorative formatting
+                        5. Text boxes, sidebars, or headers/footers with content
+                        6. Color-coded sections (ATS loses color information)
+
+                        Return JSON:
+                        {
+                          "has_columns": bool,
+                          "has_tables": bool,
+                          "has_icons": bool,
+                          "has_text_boxes": bool,
+                          "layout_issues": ["specific issue 1", "specific issue 2"],
+                          "overall_assessment": "ATS-friendly" or "ATS-unfriendly",
+                          "confidence": 0.0-1.0
+                        }
+                        """
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": f"data:image/png;base64,{images[0]}"
+                    }
+                ]
+            )
+
             response = self.vlm.invoke([message])
-            import json
             data = json.loads(response.content)
             return data
+
         except Exception as e:
-            print(f"VLM analysis failed: {e}")
+            print(f"❌ VLM analysis failed: {e}")
             return {
                 "has_columns": False,
                 "has_tables": False,
                 "has_icons": False,
+                "has_text_boxes": False,
                 "layout_issues": [],
                 "overall_assessment": "Unable to analyze",
+                "confidence": 0.0,
                 "error": str(e)
             }
 
 # Helper function
-def analyze_resume_layout(resume_text: str) -> dict:
+def analyze_resume_layout(pdf_path: str) -> dict:
+    """
+    Analyze original PDF layout.
+
+    Args:
+        pdf_path: Path to original uploaded PDF
+    """
     analyzer = LayoutAnalyzer()
-    return analyzer.analyze_layout(resume_text)
+    return analyzer.analyze_layout(pdf_path)
 ```
 
 ### 2.3: Update ATS Critic to Use Both Tools (2 hours)
@@ -608,9 +648,10 @@ def ats_critic_node(state: AgentState):
     print("  → Testing ATS parsing...")
     ats_result = check_ats_compatibility(state["resume_text"])
 
-    # Step 2: Visual layout analysis with VLM
+    # Step 2: Visual layout analysis with VLM on ORIGINAL PDF
     print("  → Analyzing visual layout with VLM...")
-    layout_result = analyze_resume_layout(state["resume_text"])
+    pdf_path = state.get("original_pdf_path")
+    layout_result = analyze_resume_layout(pdf_path)
 
     # Step 3: LLM synthesizes findings with reasoning
     synthesis_prompt = f"""
@@ -708,90 +749,181 @@ def ats_critic_node(state: AgentState):
 
 ---
 
-### 2.4: Web Search for Match Critic (2 hours)
+### 2.4: Enhanced Web Search for Match Critic (3 hours)
 
-**Problem**: Match Critic doesn't know current industry standards for skills/keywords.
+**Problem**: Match Critic doesn't know current industry standards, and needs to understand experience-based requirements.
 
-**Solution**: Add web search to validate skills are actually required.
+**Solution**: First parse entire JD with LLM to extract requirements, then validate with web search.
 
 File: `src/tools/web_search.py` (NEW)
 
 ```python
 from langchain_community.tools import DuckDuckGoSearchRun
-from typing import List, Dict
+from src.llm_registry import LLMRegistry
+from typing import List, Dict, Any
+import json
 
 class JobMarketResearch:
     """
-    Use web search to validate job requirements and skill trends.
+    Analyze job descriptions and validate requirements with web search.
     """
 
     def __init__(self):
         self.search = DuckDuckGoSearchRun()
+        self.llm = LLMRegistry.get_nova_lite()  # Cheap for extraction
 
-    def validate_skill_requirement(self, skill: str, job_title: str) -> Dict[str, any]:
+    def extract_requirements_from_jd(self, job_description: str) -> Dict[str, Any]:
         """
-        Check if a skill is commonly required for a job title.
+        Use LLM to parse entire JD and extract structured requirements.
+        Handles experience-based skills like "5 years managing Snowflake with Informatica".
+        """
+        extraction_prompt = f"""
+        Analyze this job description and extract ALL requirements in detail.
+
+        Job Description:
+        {job_description}
+
+        Extract:
+        1. **Job Title**: The specific role
+        2. **Required Skills**: Technical skills, tools, languages (e.g., Python, AWS, Docker)
+        3. **Experience Requirements**: Years of experience + context
+           - Example: "5+ years managing Snowflake data warehouses"
+           - Example: "3 years with Informatica ETL integration"
+        4. **Preferred Skills**: Nice-to-have skills
+        5. **Certifications**: Required or preferred certifications
+        6. **Domain Expertise**: Industry knowledge (e.g., fintech, healthcare)
+        7. **Soft Skills**: Communication, leadership, etc.
+
+        Return JSON:
+        {{
+          "job_title": "...",
+          "required_skills": ["skill1", "skill2"],
+          "experience_requirements": [
+            {{"years": 5, "skill": "Snowflake warehouse management", "context": "with Informatica integration"}}
+          ],
+          "preferred_skills": ["skill1"],
+          "certifications": ["cert1"],
+          "domain_expertise": ["domain1"],
+          "soft_skills": ["skill1"]
+        }}
+        """
+
+        response = self.llm.invoke(extraction_prompt)
+        try:
+            return json.loads(response.content)
+        except:
+            return {"error": "Failed to parse JD"}
+
+    def validate_skill_requirement(self, skill: str, job_title: str) -> Dict[str, Any]:
+        """
+        Check if a skill is commonly required for a job title via web search.
         """
         query = f'"{job_title}" job requirements "{skill}" site:linkedin.com OR site:indeed.com'
 
         try:
             results = self.search.run(query)
-
-            # Simple heuristic: if skill appears in results, it's validated
             skill_mentions = results.lower().count(skill.lower())
 
             return {
                 "skill": skill,
                 "validated": skill_mentions > 2,
                 "mentions": skill_mentions,
-                "evidence": results[:200]
+                "evidence": results[:300],
+                "confidence": min(skill_mentions / 10, 1.0)  # Max confidence at 10 mentions
             }
         except Exception as e:
             return {
                 "skill": skill,
                 "validated": False,
-                "error": str(e)
+                "error": str(e),
+                "confidence": 0.0
             }
 
-    def find_trending_skills(self, job_title: str) -> List[str]:
+    def validate_experience_requirement(
+        self,
+        experience_req: Dict[str, Any],
+        job_title: str
+    ) -> Dict[str, Any]:
         """
-        Find trending skills for a job title.
+        Validate experience-based requirements (e.g., "5 years with Snowflake").
         """
-        query = f'"{job_title}" required skills 2024 trends'
+        years = experience_req.get("years", "")
+        skill = experience_req.get("skill", "")
+        context = experience_req.get("context", "")
+
+        query = f'"{job_title}" "{years} years" "{skill}" {context}'
 
         try:
             results = self.search.run(query)
-            # Extract skills (simplified - could use NER)
-            # For now, return search results
-            return results
-        except Exception as e:
-            return []
+            mentions = results.lower().count(skill.lower())
 
-# Helper function
-def validate_skills(skills: List[str], job_title: str) -> Dict[str, any]:
+            return {
+                "requirement": f"{years}+ years {skill} {context}",
+                "validated": mentions > 1,
+                "mentions": mentions,
+                "evidence": results[:300]
+            }
+        except Exception as e:
+            return {
+                "requirement": f"{years}+ years {skill}",
+                "validated": False,
+                "error": str(e)
+            }
+
+# Helper functions
+def analyze_job_description(jd: str) -> Dict[str, Any]:
+    """Extract all requirements from JD using LLM."""
     researcher = JobMarketResearch()
-    results = {}
-    for skill in skills[:5]:  # Limit to 5 to avoid rate limits
-        results[skill] = researcher.validate_skill_requirement(skill, job_title)
-    return results
+    return researcher.extract_requirements_from_jd(jd)
+
+def validate_requirements(
+    requirements: Dict[str, Any],
+    job_title: str
+) -> Dict[str, Any]:
+    """Validate extracted requirements with web search."""
+    researcher = JobMarketResearch()
+
+    validated = {
+        "skills": {},
+        "experience": []
+    }
+
+    # Validate top 5 required skills
+    for skill in requirements.get("required_skills", [])[:5]:
+        validated["skills"][skill] = researcher.validate_skill_requirement(skill, job_title)
+
+    # Validate experience requirements
+    for exp_req in requirements.get("experience_requirements", [])[:3]:
+        validated["experience"].append(
+            researcher.validate_experience_requirement(exp_req, job_title)
+        )
+
+    return validated
 ```
 
-Update Match Critic to use web search:
+Update Match Critic to use enhanced web search:
 ```python
 # In critics.py, update match_critic_node:
-from src.tools.web_search import validate_skills
+from src.tools.web_search import analyze_job_description, validate_requirements
 
 def match_critic_node(state: AgentState):
-    """Match Critic with web validation."""
+    """Match Critic with deep JD analysis and web validation."""
 
-    # Extract job title from JD (simple regex)
-    import re
-    jd = state["job_description"]
-    # Look for "Looking for a [Job Title]" pattern
-    job_title_match = re.search(r'looking for (?:a |an )?(.+?)(?: with| who)', jd, re.IGNORECASE)
-    job_title = job_title_match.group(1) if job_title_match else "Software Engineer"
+    print("📊 Match Critic: Analyzing job requirements...")
 
-    # Run standard match analysis
+    # Step 1: Extract ALL requirements from JD using LLM
+    jd_requirements = analyze_job_description(state["job_description"])
+    job_title = jd_requirements.get("job_title", "Unknown")
+
+    print(f"  → Extracted requirements for {job_title}")
+    print(f"    - Required skills: {len(jd_requirements.get('required_skills', []))}")
+    print(f"    - Experience requirements: {len(jd_requirements.get('experience_requirements', []))}")
+
+    # Step 2: Validate requirements with web search
+    print("  → Validating requirements via web search...")
+    validation_results = validate_requirements(jd_requirements, job_title)
+
+    # Step 3: Run standard match analysis
     res = llm.invoke(match_prompt.invoke({
         "job_description": state["job_description"],
         "resume_text": state["resume_text"]
@@ -799,14 +931,11 @@ def match_critic_node(state: AgentState):
 
     data = json.loads(res.content)
 
-    # Validate missing keywords with web search
-    missing_keywords = data.get("missing_keywords", [])
-    if missing_keywords:
-        print(f"  → Validating {len(missing_keywords)} missing keywords via web...")
-        validation_results = validate_skills(missing_keywords, job_title)
-        data["keyword_validation"] = validation_results
+    # Step 4: Enrich with web-validated requirements
+    data["jd_analysis"] = jd_requirements
+    data["web_validation"] = validation_results
 
-    # Rest of the critique creation...
+    # Rest of critique creation...
 ```
 
 ---
@@ -866,33 +995,48 @@ Update Language Critic to use grammar checker (similar pattern to ATS critic).
 
 **Goal**: Add feedback loops so agents verify and self-correct.
 
-### 3.1: Create Verification Node (3 hours)
+### 3.1: Create Verification Node with Conditional Routing (3 hours)
 
-**Problem**: Editor makes changes but nothing checks if they actually fixed the issues.
+**Problem**: Editor makes changes but nothing checks if they actually fixed the issues. Need smart routing: if critiques not addressed, send back to editor for retry.
 
-**Solution**: Add dedicated verifier node after editor.
+**Solution**: Add dedicated verifier node with conditional routing logic.
+
+**First, update state schema** to track editor retries:
+```python
+# In src/agents/JobSeeker/state.py
+class AgentState(TypedDict):
+    # ... existing fields ...
+    editor_retry_count: int  # NEW: Track retries per iteration
+    max_editor_retries: int  # NEW: Default 2
+    unresolved_critiques: List[Critique]  # NEW: Store what wasn't fixed
+```
 
 File: `src/agents/JobSeeker/verifier.py` (NEW)
 
 ```python
 from src.agents.JobSeeker.state import AgentState, Critique
 from src.llm_registry import LLMRegistry
+from langgraph.types import Command
+from typing import Literal
 import json
 
-llm = LLMRegistry.get_haiku()  # Fast verification
+llm = LLMRegistry.get_nova_micro()  # Ultra-fast verification
 
-def verifier_node(state: AgentState) -> dict:
+def verifier_node(state: AgentState) -> Command[Literal["editor", "supervisor"]]:
     """
     Verifies that editor's changes actually addressed the critiques.
+    Routes back to editor if critiques not fixed (with max retry limit).
     """
     print("🔍 Verifier: Checking if critiques were addressed...")
 
     # Get the critiques that were supposed to be fixed
     applied_critiques = state.get("actionable_critiques", [])
+    retry_count = state.get("editor_retry_count", 0)
+    max_retries = state.get("max_editor_retries", 2)
 
     if not applied_critiques:
-        print("  ℹ️ No critiques to verify")
-        return {}
+        print("  ℹ️ No critiques to verify - moving to supervisor")
+        return Command(goto="supervisor")
 
     # Compare before/after
     verification_prompt = f"""
@@ -908,6 +1052,7 @@ def verifier_node(state: AgentState) -> dict:
     1. Was it addressed? (yes/no)
     2. Quality of the fix (0-1)
     3. Any new issues introduced?
+    4. Specific unresolved critiques with reasons
 
     Return JSON:
     {{
@@ -917,11 +1062,13 @@ def verifier_node(state: AgentState) -> dict:
       "unresolved": [
         {{
           "critique_id": "...",
-          "reason": "why it wasn't fixed"
+          "critique_summary": "...",
+          "reason": "why it wasn't fixed",
+          "guidance": "specific instruction for editor"
         }}
       ],
       "new_issues": ["issue1", "issue2"],
-      "should_retry": false
+      "pass_verification": true/false
     }}
     """
 
@@ -933,6 +1080,7 @@ def verifier_node(state: AgentState) -> dict:
         addressed = data["critiques_addressed"]
         total = data["critiques_total"]
         quality = data["overall_quality"]
+        pass_verification = data.get("pass_verification", addressed == total)
 
         print(f"  ✓ Verification: {addressed}/{total} critiques addressed")
         print(f"  📊 Quality: {quality:.0%}")
@@ -942,18 +1090,64 @@ def verifier_node(state: AgentState) -> dict:
             for issue in data["new_issues"]:
                 print(f"    - {issue}")
 
-        # Decide if we need to retry
-        should_retry = data.get("should_retry", False)
+        # ROUTING DECISION
+        if pass_verification:
+            print("  ✅ Verification passed - moving to supervisor")
+            return Command(
+                goto="supervisor",
+                update={
+                    "verification_result": data,
+                    "editor_retry_count": 0  # Reset for next iteration
+                }
+            )
+        else:
+            # Check if we can retry
+            if retry_count < max_retries:
+                print(f"  🔄 Verification failed - retrying editor ({retry_count + 1}/{max_retries})")
 
-        return {
-            "verification_result": data,
-            "needs_editor_retry": should_retry
-        }
+                # Create focused critiques for retry
+                unresolved = []
+                for unresolved_item in data.get("unresolved", []):
+                    unresolved.append(Critique(
+                        source="Verifier",
+                        summary=unresolved_item["guidance"],
+                        details=unresolved_item,
+                        resolved=False,
+                        confidence=0.9
+                    ))
+
+                return Command(
+                    goto="editor",
+                    update={
+                        "actionable_critiques": unresolved,  # Send focused critiques
+                        "editor_retry_count": retry_count + 1,
+                        "verification_result": data
+                    }
+                )
+            else:
+                print(f"  ⚠️ Max retries ({max_retries}) reached - moving to supervisor anyway")
+                return Command(
+                    goto="supervisor",
+                    update={
+                        "verification_result": data,
+                        "editor_retry_count": 0,
+                        "unresolved_critiques": data.get("unresolved", [])
+                    }
+                )
 
     except Exception as e:
-        print(f"❌ Verification error: {e}")
-        return {"verification_result": None}
+        print(f"❌ Verification error: {e} - defaulting to supervisor")
+        return Command(
+            goto="supervisor",
+            update={"verification_result": {"error": str(e)}}
+        )
 ```
+
+**Expected Impact**:
+- ✅ Verifier acts as quality gate
+- ✅ Automatic retry if critiques not fixed (max 2 times)
+- ✅ Focused feedback to editor on retry ("You missed X, Y, Z")
+- ✅ Safety: Always moves forward after max retries
 
 ### 3.2: Add Reflection to Editor (2 hours)
 
@@ -1012,7 +1206,7 @@ def editor_node(state: AgentState):
     }
 ```
 
-### 3.3: Update Graph with Verification Node (1 hour)
+### 3.3: Update Graph with Conditional Verification Routing (1 hour)
 
 File: `src/agents/JobSeeker/graph.py`
 
@@ -1051,10 +1245,26 @@ def build_job_seeker_graph():
     workflow.add_edge("impact_critic", "consolidator")
 
     workflow.add_edge("consolidator", "editor")
-    workflow.add_edge("editor", "verifier")     # NEW: Editor → Verifier
-    workflow.add_edge("verifier", "supervisor")  # NEW: Verifier → Supervisor
+    workflow.add_edge("editor", "verifier")  # NEW: Editor → Verifier
+
+    # NOTE: Verifier uses Command routing (returns Command[Literal["editor", "supervisor"]])
+    # No explicit edge needed - verifier node handles routing internally:
+    #   - If verification passes → supervisor
+    #   - If verification fails & retries < max → editor (retry loop)
+    #   - If verification fails & retries >= max → supervisor (safety valve)
 
     return workflow.compile()
+```
+
+**New Flow Diagram:**
+```
+START → Supervisor
+          ↓
+       Critics (parallel) → Consolidator → Editor → Verifier
+                                               ↑      ↓
+                                               └──────┘ (retry loop if needed)
+                                                      ↓
+                                                 Supervisor → END or loop again
 ```
 
 ---
@@ -1063,17 +1273,22 @@ def build_job_seeker_graph():
 
 **Goal**: Memory, conditional routing, and full agency.
 
-### 4.1: Add Memory System (4 hours)
+### 4.1: Add Memory System for Tracking (3 hours)
+
+**IMPORTANT**: This is for **tracking and reporting only** - NO automatic action based on effectiveness.
 
 File: `src/agents/JobSeeker/memory.py` (NEW)
 
 ```python
 from typing import List, Dict, Any
 from src.agents.JobSeeker.state import Critique
+from datetime import datetime
+import json
 
 class RevisionMemory:
     """
     Tracks what was tried, what worked, what failed.
+    Used for manual review and optimization - does NOT automatically skip critics.
     """
 
     @staticmethod
@@ -1085,7 +1300,7 @@ class RevisionMemory:
         success: bool
     ) -> Dict[str, Any]:
         """
-        Log a revision attempt.
+        Log a revision attempt for later analysis.
         """
         return {
             "iteration": iteration,
@@ -1099,6 +1314,7 @@ class RevisionMemory:
     def analyze_patterns(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         Identify patterns: which critics are most effective?
+        FOR MANUAL REVIEW ONLY - not used for automatic routing.
         """
         critic_effectiveness = {}
 
@@ -1126,35 +1342,241 @@ class RevisionMemory:
 
         return critic_effectiveness
 
-# Use in supervisor to skip ineffective critics
-```
-
-### 4.2: Conditional Routing (3 hours)
-
-Update supervisor to route based on history:
-```python
-def supervisor_node(state: AgentState) -> Command[...]:
-    # ... quality checks ...
-
-    # Analyze memory
-    history = state.get("revision_history", [])
-    if len(history) >= 2:
+    @staticmethod
+    def generate_report(history: List[Dict[str, Any]]) -> str:
+        """
+        Generate markdown report for manual review.
+        """
         effectiveness = RevisionMemory.analyze_patterns(history)
 
-        # Skip critics that haven't been effective
-        ineffective_critics = [
-            c for c, stats in effectiveness.items()
-            if stats["success_rate"] < 0.3
-        ]
+        report = "# Critic Effectiveness Report\n\n"
+        report += f"**Total Iterations:** {len(history)}\n\n"
+        report += "## Critic Performance\n\n"
+        report += "| Critic | Attempts | Success Rate | Avg Improvement |\n"
+        report += "|--------|----------|--------------|------------------|\n"
 
-        if ineffective_critics:
-            print(f"  📊 Skipping ineffective critics: {ineffective_critics}")
-            # Would need to modify graph to support dynamic routing
+        for critic, stats in sorted(
+            effectiveness.items(),
+            key=lambda x: x[1]["success_rate"],
+            reverse=True
+        ):
+            report += f"| {critic} | {stats['attempts']} | {stats['success_rate']:.0%} | {stats['avg_improvement']:+.2f} |\n"
+
+        return report
+
+# Helper to save report for manual review
+def save_effectiveness_report(state: AgentState, output_path: str = "critic_effectiveness_report.md"):
+    """
+    Save effectiveness report to file for manual review.
+    Call at the end of optimization.
+    """
+    history = state.get("revision_history", [])
+    if history:
+        report = RevisionMemory.generate_report(history)
+        with open(output_path, 'w') as f:
+            f.write(report)
+        print(f"📊 Effectiveness report saved to {output_path}")
+```
+
+**Usage in main loop:**
+```python
+# At end of optimization
+save_effectiveness_report(final_state, "reports/effectiveness_report.md")
+# User can review and decide if they want to disable any critics
+```
+
+### 4.2: Markdown Output + PDF Export (2 hours)
+
+**Problem**: Need to output optimized CV in markdown format and allow PDF export.
+
+**Solution**: Format output as markdown and add PDF rendering utility.
+
+File: `src/tools/markdown_formatter.py` (NEW)
+
+```python
+from typing import Dict, Any
+import markdown
+from weasyprint import HTML
+from io import BytesIO
+
+class MarkdownFormatter:
+    """
+    Format resume as markdown and export to PDF.
+    """
+
+    @staticmethod
+    def format_resume_as_markdown(resume_text: str) -> str:
+        """
+        Ensure resume text is properly formatted as markdown.
+        Adds proper headers, bold text, bullet points, etc.
+        """
+        # Resume should already be markdown from editor
+        # This function ensures consistent formatting
+
+        lines = resume_text.split('\n')
+        formatted_lines = []
+
+        for line in lines:
+            stripped = line.strip()
+
+            # Ensure headers have proper markdown syntax
+            if stripped and not stripped.startswith('#') and len(stripped) < 50:
+                # Might be a section header - check if all caps or title case
+                if stripped.isupper() or stripped.istitle():
+                    formatted_lines.append(f"## {stripped}")
+                    continue
+
+            formatted_lines.append(line)
+
+        return '\n'.join(formatted_lines)
+
+    @staticmethod
+    def markdown_to_pdf(markdown_text: str, output_path: str) -> str:
+        """
+        Convert markdown to PDF using WeasyPrint.
+
+        Args:
+            markdown_text: The markdown-formatted resume
+            output_path: Where to save the PDF
+
+        Returns:
+            Path to generated PDF
+        """
+        # Convert markdown to HTML
+        html_content = markdown.markdown(
+            markdown_text,
+            extensions=['extra', 'nl2br', 'sane_lists']
+        )
+
+        # Add CSS styling for professional resume look
+        styled_html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <style>
+                body {{
+                    font-family: 'Calibri', 'Arial', sans-serif;
+                    font-size: 11pt;
+                    line-height: 1.4;
+                    margin: 0.5in;
+                    color: #333;
+                }}
+                h1 {{
+                    font-size: 20pt;
+                    margin-bottom: 0.2em;
+                    color: #000;
+                }}
+                h2 {{
+                    font-size: 14pt;
+                    margin-top: 0.8em;
+                    margin-bottom: 0.3em;
+                    border-bottom: 1px solid #333;
+                    color: #000;
+                }}
+                h3 {{
+                    font-size: 12pt;
+                    margin-top: 0.5em;
+                    margin-bottom: 0.2em;
+                }}
+                ul {{
+                    margin-top: 0.3em;
+                    margin-bottom: 0.5em;
+                    padding-left: 1.5em;
+                }}
+                li {{
+                    margin-bottom: 0.2em;
+                }}
+                strong {{
+                    color: #000;
+                }}
+                p {{
+                    margin: 0.3em 0;
+                }}
+            </style>
+        </head>
+        <body>
+            {html_content}
+        </body>
+        </html>
+        """
+
+        # Generate PDF
+        HTML(string=styled_html).write_pdf(output_path)
+        return output_path
+
+# Helper functions
+def export_resume_as_markdown(resume_text: str, output_path: str) -> str:
+    """Save resume as markdown file."""
+    formatter = MarkdownFormatter()
+    formatted = formatter.format_resume_as_markdown(resume_text)
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(formatted)
+
+    return output_path
+
+def export_resume_as_pdf(resume_text: str, output_path: str) -> str:
+    """Convert resume to PDF."""
+    formatter = MarkdownFormatter()
+    formatted = formatter.format_resume_as_markdown(resume_text)
+    return formatter.markdown_to_pdf(formatted, output_path)
+```
+
+**Install dependencies:**
+```bash
+pip install markdown weasyprint
+```
+
+**Update Editor to output markdown:**
+```python
+# In editor.py
+def editor_node(state: AgentState):
+    # ... existing code ...
+
+    editor_prompt_text = f"""
+    You are an Expert Resume Editor. Apply these critiques carefully.
+
+    CURRENT CV:
+    {state["resume_text"]}
+
+    CRITIQUES TO IMPLEMENT (prioritized):
+    {feedback_str}
+
+    INSTRUCTIONS:
+    1. Apply ONLY the critiques listed above
+    2. Output the resume in MARKDOWN format:
+       - Use ## for section headers (e.g., ## Experience)
+       - Use **bold** for job titles, company names
+       - Use bullet points (- ) for achievements
+       - Use proper line spacing
+    3. Maintain ATS-friendly structure (no tables, no columns)
+
+    Return ONLY the full, rewritten CV in markdown format.
+    """
+    # ... rest of editor code
+```
+
+**Usage:**
+```python
+# After optimization completes
+final_resume = final_state["resume_text"]
+
+# Save markdown
+export_resume_as_markdown(final_resume, "output/optimized_resume.md")
+
+# Export PDF
+export_resume_as_pdf(final_resume, "output/optimized_resume.pdf")
+
+print("✅ Resume exported as:")
+print("  - Markdown: output/optimized_resume.md")
+print("  - PDF: output/optimized_resume.pdf")
 ```
 
 ### 4.3: Full ReAct Pattern (3 hours)
 
-Convert critics to full ReAct (Reasoning + Acting):
+Convert critics to full ReAct (Reasoning + Acting) 
+Example :
 ```python
 def ats_critic_node_react(state: AgentState):
     """
@@ -1211,9 +1633,9 @@ def ats_critic_node_react(state: AgentState):
 
 ### Phase 0: Setup ✓
 - [ ] Update state schema with new fields
-- [ ] Create LLM registry
+- [x] Create LLM registry
 - [ ] Create tools directory structure
-- [ ] Install dependencies: `pip install language-tool-python reportlab`
+- [x] Install dependencies: `pip install language-tool-python reportlab`
 
 ### Phase 1: Quick Wins (2-3 hours) ✓
 - [ ] Add quality evaluation to editor
@@ -1282,38 +1704,6 @@ def test_agentic_flow():
     assert "tool_evidence" in final_state["critique_inputs"][0]
 ```
 
----
-
-## Cost Estimation (December 2025 Pricing)
-
-### Per Resume Optimization (3 iterations):
-
-| Component | Model | Pricing | Calls | Tokens | Total |
-|-----------|-------|---------|-------|--------|-------|
-| **ATS Critic (Text)** | Claude Haiku 4.5 | $0.80/1M | 3 | 2K × 3 = 6K | $0.0048 |
-| **ATS Critic (Vision)** | Pixtral Large | FREE | 3 | 2K × 3 = 6K | $0 |
-| **Match Critic** | Amazon Nova Lite | $0.06/1M | 3 | 2K × 3 = 6K | $0.00036 |
-| **Truth Critic** | Claude Sonnet 4.5 | $3.00/1M | 3 | 2K × 3 = 6K | $0.018 |
-| **Language Critic** | Ministral 3B | FREE | 3 | 2K × 3 = 6K | $0 |
-| **Impact Critic** | Claude Haiku 4.5 | $0.80/1M | 3 | 2K × 3 = 6K | $0.0048 |
-| **Consolidator** | Claude Sonnet 4.5 | $3.00/1M | 3 | 5K × 3 = 15K | $0.045 |
-| **Editor** | GPT-OSS-120B | $1.00/1M | 3 | 8K × 3 = 24K | $0.024 |
-| **Verifier** | Amazon Nova Micro | $0.035/1M | 3 | 3K × 3 = 9K | $0.00032 |
-| **Supervisor** | Amazon Nova Micro | $0.035/1M | 4 | 500 × 4 = 2K | $0.00007 |
-| **TOTAL** | - | - | - | ~77K tokens | **~$0.10/resume** |
-
-**With Adaptive Stopping** (avg 2.2 iterations): **~$0.07/resume**
-
-**Cost Breakdown by Provider:**
-- AWS Bedrock: ~$0.097 (Nova Micro/Lite + Claude + GPT-OSS)
-- Mistral AI: $0 (Pixtral Large + Ministral 3B on free tier)
-
-**Monthly Volume Estimates:**
-- 100 resumes/month: ~$10/month (with adaptive stopping: ~$7/month)
-- 1,000 resumes/month: ~$100/month (with adaptive stopping: ~$70/month)
-- 10,000 resumes/month: ~$1,000/month (with adaptive stopping: ~$700/month)
-
----
 
 ## Success Metrics
 
@@ -1323,8 +1713,6 @@ def test_agentic_flow():
 | **False Positive Critiques** | ~40% | <10% | Tool-grounded evidence |
 | **Quality Improvement** | N/A | +20 points | Before/after scoring |
 | **Unnecessary Iterations** | 33% (fixed 3) | <10% | Adaptive stopping |
-| **Cost per Resume** | N/A | <$0.02 | AWS billing |
-| **User Satisfaction** | N/A | >4/5 | User feedback |
 
 ---
 
@@ -1336,22 +1724,3 @@ def test_agentic_flow():
 4. **Week 4**: Phase 3 completion + Phase 4 (Reflection + Memory)
 5. **Week 5**: Testing, optimization, documentation
 
----
-
-## Rollback Plan
-
-Each phase is additive, so rollback is simple:
-- Keep old files in `src/agents/JobSeeker/legacy/`
-- Use feature flags: `USE_AGENTIC_MODE = True`
-- Can switch back by changing graph imports
-
----
-
-## Next Steps
-
-1. **Review this plan** - Any changes needed?
-2. **Start Phase 0** - Set up architecture (30 min)
-3. **Quick win with Phase 1** - See immediate improvements (2-3 hours)
-4. **Plan Phase 2 sprint** - Schedule tool integration work
-
-Ready to start implementing? Which phase should we begin with?

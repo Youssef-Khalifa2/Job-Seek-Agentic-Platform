@@ -11,3 +11,6 @@ tiktoken
 streamlit
 python-dotenv
 boto3
+language-tool-python
+reportlab
+pdf2image
