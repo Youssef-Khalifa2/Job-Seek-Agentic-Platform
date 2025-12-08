@@ -1,18 +1,13 @@
 import json
 from typing import List, Dict, Any
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_mistralai import ChatMistralAI
 from src.agents.JobSeeker.state import AgentState, Critique
+from src.tools.ats_parser import check_ats_compatibility
+from src.tools.layout_analyzer import analyze_resume_layout
 import config
+from src.llm_registry import LLMRegistry
 
-# We use Flash for speed, but enforce JSON mode for structure.
-#llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=config.GEMINI_API_KEY, model_kwargs={"response_mime_type": "application/json"} )
-llm = ChatMistralAI(
-    model="mistral-small-latest",
-    mistral_api_key=config.MISTRAL_API_KEY,
-    model_kwargs={"response_format": {"type": "json_object"}}
-)
+llm = LLMRegistry.get_pixtral_large()
 
 # helper to safely parse the JSON
 def parse_critic_output(response_content: str, critic_name: str) -> str:
@@ -155,33 +150,93 @@ OUTPUT JSON:
 # --- Node Functions ---
 
 def ats_critic_node(state: AgentState):
-    res = llm.invoke(ats_prompt.invoke({"resume_text": state["resume_text"]}))
+    """
+    ATS Critic with DUAL analysis: 
+    1. Text-based ATS parsing (The 'Black Box')
+    2. Visual layout analysis (The 'Eyes')
+    """
+    print("🤖 ATS Critic: Running dual analysis...")
+    
+    # 1. Run the Tools
+    # We use the original PDF path for accurate visual/parsing analysis
+    pdf_path = state.get("original_pdf_path")
+    
+    if not pdf_path:
+        print("  ⚠️ No PDF path found. Skipping deep analysis.")
+        return {"critique_inputs": []}
+
+    print("  → Testing ATS parsing...")
+    ats_result = check_ats_compatibility(pdf_path)
+
+    print("  → Analyzing visual layout with VLM...")
+    layout_result = analyze_resume_layout(pdf_path)
+
+    # 2. Synthesize findings with LLM
+    # We give the LLM the hard data so it can explain *why* something is wrong.
+    synthesis_prompt = f"""
+    You are an Expert ATS Auditor. Analyze these forensic test results.
+
+    EVIDENCE #1: REAL ATS PARSER OUTPUT
+    {json.dumps(ats_result, indent=2)}
+
+    EVIDENCE #2: VISUAL LAYOUT ANALYSIS (VLM)
+    {json.dumps(layout_result, indent=2)}
+
+    TASK:
+    Compare the two evidences. 
+    - If VLM sees a "Skills" section but ATS Parser returned "skills": [], that is a CRITICAL parsing failure caused by layout.
+    - If VLM sees columns and ATS Parser missed fields, blame the columns.
+    - If both are fine, give a high score.
+
+    OUTPUT JSON:
+    {{
+        "score": 0-100,
+        "critical_issues": ["Specific parsing failure 1", "Specific layout risk 2"],
+        "warnings": ["minor issue 1"],
+        "reasoning": "Explain the connection between layout and parsing errors."
+    }}
+    """
+    
+    # Use a fast model (Haiku/Mistral Small) for synthesis
+    res = llm.invoke(synthesis_prompt)
 
     try:
-        # Parse JSON to get both raw data and summary
         data = json.loads(res.content)
-        summary = parse_critic_output(res.content, "ATS Critic")
+        
+        # Helper logic: If tools found errors, confidence is high (we have proof).
+        # If tools are clean, confidence is slightly lower (false negatives possible).
+        tool_evidence_found = (
+            not ats_result.get("parsable_status", True) or 
+            layout_result.get("has_columns", False)
+        )
+        confidence = 0.95 if tool_evidence_found else 0.8
 
-        # Create Critique object
+        # Create the summary
+        summary = f"### 🤖 ATS Report (Score: {data.get('score')})\n"
+        for issue in data.get("critical_issues", []):
+            summary += f"- 🔴 **CRITICAL:** {issue}\n"
+        for warn in data.get("warnings", []):
+            summary += f"- ⚠️ {warn}\n"
+
         critique = Critique(
             source="ATS Critic",
             summary=summary,
             details=data,
-            resolved=False
+            resolved=False,
+            confidence=confidence,
+            reasoning=data.get("reasoning", ""),
+            tool_evidence={
+                "ats_parser": ats_result, 
+                "layout": layout_result
+            }
         )
 
+        print(f"  ✓ Analysis complete. Score: {data.get('score')}")
         return {"critique_inputs": [critique]}
-    except json.JSONDecodeError as e:
-        print(f"❌ ATS Critic JSON Error: {e}")
-        print(f"Response content: {res.content[:200]}")  # Print first 200 chars
-        # Return error critique
-        error_critique = Critique(
-            source="ATS Critic",
-            summary=f"### Error\nFailed to parse JSON: {str(e)}",
-            details={"error": str(e), "raw_response": res.content[:500]},
-            resolved=False
-        )
-        return {"critique_inputs": [error_critique]}
+
+    except Exception as e:
+        print(f"❌ ATS Critic synthesis failed: {e}")
+        return {"critique_inputs": []}
 
 def match_critic_node(state: AgentState):
     res = llm.invoke(match_prompt.invoke({"job_description": state["job_description"], "resume_text": state["resume_text"]}))

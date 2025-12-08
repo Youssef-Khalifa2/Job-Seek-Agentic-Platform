@@ -1,57 +1,61 @@
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_aws import ChatBedrock
 from src.agents.JobSeeker.state import AgentState
-import config
+from src.llm_registry import LLMRegistry
 from src.utils import filter_reasoning
 
-llm = ChatBedrock(
-            model_id="openai.gpt-oss-120b-1:0",
-            aws_access_key_id=config.AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY,
-            region_name=config.AWS_REGION,
-        )
+# Strong instruction-following model for execution
+llm = LLMRegistry.get_gpt_oss() 
 
 editor_prompt = ChatPromptTemplate.from_template("""
-You are an Expert Resume Editor.
-Your goal is to apply specific feedback to a candidate's CV.
+You are an Expert Resume Editor. 
+Your goal is to EXECUTE the following changes on the candidate's CV.
 
 CURRENT CV:
 {resume_text}
 
-FEEDBACK TO IMPLEMENT:
+INSTRUCTIONS TO EXECUTE:
 {critiques_list}
 
-INSTRUCTIONS:
-1. Apply the requested changes **surgically**. Do not rewrite parts of the CV that were not mentioned in the feedback.
-2. Maintain the original structure and formatting as much as possible.
-3. If the feedback asks for a metric you don't have, use a placeholder like [X%].
+RULES:
+1. Trust these instructions; they have already been verified.
+2. Apply changes **surgically**. Do not rewrite sections that aren't mentioned.
+3. Maintain the original structure and formatting unless told otherwise.
+4. If asked to add metrics but none are provided, use placeholders like [X%].
 
 OUTPUT:
-Return ONLY the full, rewritten CV text. Do not add conversational filler.
+Return ONLY the full, rewritten CV text (Markdown format).
 """)
 
 def editor_node(state: AgentState):
     """
-    Applies the actionable critiques to the resume text.
+    Pure execution node. Applies the pre-validated critiques.
     """
-    print(f"✍️ Editor is fixing {len(state['actionable_critiques'])} issues...")
+    critiques = state.get("actionable_critiques", [])
     
-    # 1. Format the critiques for the LLM
+    if not critiques:
+        print("  😴 Editor has no critiques to apply. Skipping.")
+        return {
+            "revision_count": state["revision_count"] + 1
+        }
+
+    print(f"✍️ Editor applying {len(critiques)} verified critiques...")
+    
+    # 1. Format instructions
     feedback_str = ""
-    for c in state["actionable_critiques"]:
-        feedback_str += f"- {c.summary}\n"
+    for c in critiques:
+        feedback_str += f"- {c.summary} (Reasoning: {c.reasoning})\n"
     
+    # 2. Execute
     msg = editor_prompt.invoke({
         "resume_text": state["resume_text"],
         "critiques_list": feedback_str
     })
     
     response = llm.invoke(msg)
-
     filtered_content = filter_reasoning(response)
 
     return {
         "resume_text": filtered_content,          
         "revision_count": state["revision_count"] + 1,
-        "actionable_critiques": []                 
+        "actionable_critiques": [] # Clear queue after applying
     }

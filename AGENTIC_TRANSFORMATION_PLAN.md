@@ -1,4 +1,5 @@
-# Agentic Transformation Plan: Career Nexus CV Optimizer
+# 
+: Career Nexus CV Optimizer
 
 ## Executive Summary
 

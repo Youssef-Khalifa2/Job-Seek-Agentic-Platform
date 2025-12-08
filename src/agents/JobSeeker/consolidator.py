@@ -1,42 +1,39 @@
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_mistralai import ChatMistralAI
+# We can use a smarter model here since this is the critical "Decision Point"
+from src.llm_registry import LLMRegistry 
 from src.agents.JobSeeker.state import AgentState, Critique
 from typing import Set
 import json
-import config
 
-llm = ChatMistralAI(
-    model="mistral-small-latest", # Use a smarter model for synthesis
-    mistral_api_key=config.MISTRAL_API_KEY
-)
+# Use Sonnet or GPT-OSS for better reasoning on conflicts, 
+# or stick to Mistral Small if speed/cost is priority.
+llm = LLMRegistry.get_mistral_medium()
 
 consolidate_prompt = ChatPromptTemplate.from_template("""
-You are the **Lead Editor**. 5 specialists have critiqued a resume.
-Your job is to merge their feedback and DELETE low-priority advice.
+You are the **Lead Editor**. Specialists have critiqued a resume.
+Your job is to merge their feedback, RESOLVE CONFLICTS, and FILTER out bad advice.
 
 INPUT CRITIQUES:
 {raw_critiques}
 
 RULES:
-1. **Merge Duplicates:** If ATS and Language critics both mention "passive voice," make it ONE item.
-2. **Drop Low Priority:**
-   - DELETE nitpicks about single words (unless critical keywords).
-   - DELETE vague advice like "make it pop."
-   - DELETE anything that requires information the candidate obviously doesn't have.
-3. **Prioritize:**
-   - MISSING KEYWORDS (Critical)
-   - BROKEN FORMATTING (Critical)
-   - UNSUPPORTED CLAIMS (Critical)
-   - WEAK METRICS (Important)
+1. **Merge Duplicates:** If ATS and Language critics both mention the same issue, combine them.
+2. **Resolve Conflicts:** If one critic says "delete summary" and another says "expand summary", pick the one that best serves the candidate and discard the other.
+3. **Quality Filter (The Gatekeeper):**
+   - DELETE vague advice (e.g., "make it pop").
+   - DELETE advice requiring missing info (e.g., "add GPA" if unknown).
+   - DELETE nitpicks unless they are critical keywords.
+4. **Scoring:** Assign a confidence score (0.0 - 1.0) to each final item.
 
-STRICT OUTPUT FORMAT IS JSON AS FOLLOWS:
+STRICT OUTPUT FORMAT IS JSON:
 {{
   "consolidated_list": [
     {{
-      "source": "Merged Source (e.g. 'ATS + Match')",
-      "summary": "Specific instruction for the editor...",
-      "details": {{ ...merged details... }},
+      "source": "Merged Source",
+      "summary": "Clear, actionable instruction for the editor...",
+      "details": {{ "original_critiques": [...] }},
+      "confidence": 0.95,
+      "reasoning": "Why this change is necessary...",
       "resolved": false
     }}
   ]
@@ -45,12 +42,12 @@ STRICT OUTPUT FORMAT IS JSON AS FOLLOWS:
 
 def consolidator_node(state: AgentState):
     """
-    Merges 5 critique streams into one actionable list.
-    Filters out already-resolved critiques from previous loops.
+    Merges critique streams, resolves conflicts, and filters low-quality advice.
+    Centralizes the 'Thinking' logic here so Editor can just 'Act'.
     """
-    print("🧠 Consolidating critiques...")
+    print("🧠 Consolidating & Filtering critiques...")
 
-    # 1. Get resolved IDs from previous loops
+    # 1. Get resolved IDs
     resolved_ids = state.get("resolved_critique_ids", set())
 
     # 2. Filter out already-resolved critiques
@@ -60,43 +57,39 @@ def consolidator_node(state: AgentState):
         if c.id not in resolved_ids
     ]
 
-    print(f"📊 Total critiques: {len(all_critiques)}")
-    print(f"🔍 Unresolved critiques: {len(unresolved_critiques)}")
-    print(f"✅ Filtered out: {len(all_critiques) - len(unresolved_critiques)} resolved")
+    if not unresolved_critiques:
+        print("  ✨ No new critiques to process.")
+        return {"actionable_critiques": []}
 
-    # 3. Pass only unresolved critiques to LLM
+    # 3. Pass to LLM
     raw_inputs = [c.model_dump() for c in unresolved_critiques]
     msg = consolidate_prompt.invoke({"raw_critiques": json.dumps(raw_inputs)})
     response = llm.invoke(msg)
 
     # 4. Parse LLM output
     try:
-        # Strip markdown code blocks if present
+        # (Your existing JSON cleaning logic here...)
         content = response.content.strip()
-
-        # Handle case where LLM adds text before JSON block
         if "```json" in content:
-            # Extract content between ```json and ```
-            start = content.find("```json") + 7
-            end = content.find("```", start)
-            if end != -1:
-                content = content[start:end].strip()
+            content = content.split("```json")[1].split("```")[0]
+        elif "```" in content:
+            content = content.split("```")[1]
+            
+        data = json.loads(content.strip())
+        
+        # Create objects and filter by confidence
+        new_actionables = []
+        for item in data.get("consolidated_list", []):
+            # The Consolidator is the "Quality Gate" now
+            # We can programmatically enforce a threshold here if we want
+            if item.get("confidence", 0) >= 0.7: 
+                new_actionables.append(Critique(**item))
             else:
-                content = content[start:].strip()
-        elif content.startswith("```"):
-            # Simple case: starts with ```
-            content = content[3:]
-            if content.endswith("```"):
-                content = content[:-3]
-            content = content.strip()
-        elif content.endswith("```"):
-            content = content[:-3].strip()
+                print(f"  🗑️ Dropped low-confidence item: {item.get('summary')}")
 
-        data = json.loads(content)
-        new_actionables = [Critique(**item) for item in data.get("consolidated_list", [])]
+        print(f"  ✅ Consolidator produced {len(new_actionables)} actionable items")
 
-        # 5. Mark consolidated critiques as resolved
-        # Strategy: Mark all unresolved critiques as resolved after consolidation
+        # Mark inputs as processed
         newly_resolved_ids = {c.id for c in unresolved_critiques}
         updated_resolved_ids = resolved_ids.union(newly_resolved_ids)
 
@@ -104,17 +97,10 @@ def consolidator_node(state: AgentState):
             "actionable_critiques": new_actionables,
             "resolved_critique_ids": updated_resolved_ids
         }
-    except json.JSONDecodeError as e:
-        print(f"❌ Consolidation JSON Error: {e}")
-        print(f"Response content: {response.content[:200]}")
-        return {
-            "actionable_critiques": [],
-            "resolved_critique_ids": resolved_ids  # Keep existing
-        }
+
     except Exception as e:
         print(f"❌ Consolidation Error: {e}")
-        print(f"Response content: {response.content[:200]}")
         return {
             "actionable_critiques": [],
-            "resolved_critique_ids": resolved_ids  # Keep existing
+            "resolved_critique_ids": resolved_ids 
         }
