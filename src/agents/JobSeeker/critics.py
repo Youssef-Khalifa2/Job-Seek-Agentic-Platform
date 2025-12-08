@@ -2,14 +2,16 @@ import json
 from typing import List, Dict, Any
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
-from src.agents.state import AgentState
+from langchain_mistralai import ChatMistralAI
+from src.agents.JobSeeker.state import AgentState, Critique
 import config
 
 # We use Flash for speed, but enforce JSON mode for structure.
-llm = ChatGoogleGenerativeAI(
-    model="gemini-1.5-flash", 
-    google_api_key=config.GOOGLE_API_KEY,
-    model_kwargs={"response_mime_type": "application/json"} 
+#llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=config.GEMINI_API_KEY, model_kwargs={"response_mime_type": "application/json"} )
+llm = ChatMistralAI(
+    model="mistral-small-latest",
+    mistral_api_key=config.MISTRAL_API_KEY,
+    model_kwargs={"response_format": {"type": "json_object"}}
 )
 
 # helper to safely parse the JSON
@@ -154,24 +156,121 @@ OUTPUT JSON:
 
 def ats_critic_node(state: AgentState):
     res = llm.invoke(ats_prompt.invoke({"resume_text": state["resume_text"]}))
-    return {"critique_feedback": [parse_critic_output(res.content, "ATS Critic")]}
+
+    try:
+        # Parse JSON to get both raw data and summary
+        data = json.loads(res.content)
+        summary = parse_critic_output(res.content, "ATS Critic")
+
+        # Create Critique object
+        critique = Critique(
+            source="ATS Critic",
+            summary=summary,
+            details=data,
+            resolved=False
+        )
+
+        return {"critique_inputs": [critique]}
+    except json.JSONDecodeError as e:
+        print(f"❌ ATS Critic JSON Error: {e}")
+        print(f"Response content: {res.content[:200]}")  # Print first 200 chars
+        # Return error critique
+        error_critique = Critique(
+            source="ATS Critic",
+            summary=f"### Error\nFailed to parse JSON: {str(e)}",
+            details={"error": str(e), "raw_response": res.content[:500]},
+            resolved=False
+        )
+        return {"critique_inputs": [error_critique]}
 
 def match_critic_node(state: AgentState):
     res = llm.invoke(match_prompt.invoke({"job_description": state["job_description"], "resume_text": state["resume_text"]}))
-    return {"critique_feedback": [parse_critic_output(res.content, "JD Match Critic")]}
+
+    try:
+        # Parse JSON to get both raw data and summary
+        data = json.loads(res.content)
+        summary = parse_critic_output(res.content, "JD Match Critic")
+
+        # Create Critique object
+        critique = Critique(
+            source="JD Match Critic",
+            summary=summary,
+            details=data,
+            resolved=False
+        )
+
+        return {"critique_inputs": [critique]}
+    except json.JSONDecodeError as e:
+        print(f"❌ JD Match Critic JSON Error: {e}")
+        print(f"Response content: {res.content[:200]}")
+        error_critique = Critique(
+            source="JD Match Critic",
+            summary=f"### Error\nFailed to parse JSON: {str(e)}",
+            details={"error": str(e), "raw_response": res.content[:500]},
+            resolved=False
+        )
+        return {"critique_inputs": [error_critique]}
 
 def truth_critic_node(state: AgentState):
     res = llm.invoke(truth_prompt.invoke({"resume_text": state["resume_text"]}))
-    return {"critique_feedback": [parse_critic_output(res.content, "Truth Critic")]}
+
+    try:
+        # Parse JSON to get both raw data and summary
+        data = json.loads(res.content)
+        summary = parse_critic_output(res.content, "Truth Critic")
+
+        # Create Critique object
+        critique = Critique(
+            source="Truth Critic",
+            summary=summary,
+            details=data,
+            resolved=False
+        )
+
+        return {"critique_inputs": [critique]}
+    except json.JSONDecodeError as e:
+        print(f"❌ Truth Critic JSON Error: {e}")
+        print(f"Response content: {res.content[:200]}")
+        error_critique = Critique(
+            source="Truth Critic",
+            summary=f"### Error\nFailed to parse JSON: {str(e)}",
+            details={"error": str(e), "raw_response": res.content[:500]},
+            resolved=False
+        )
+        return {"critique_inputs": [error_critique]}
 
 def language_critic_node(state: AgentState):
     res = llm.invoke(language_prompt.invoke({"resume_text": state["resume_text"]}))
-    return {"critique_feedback": [parse_critic_output(res.content, "Language Critic")]}
+
+    try:
+        # Parse JSON to get both raw data and summary
+        data = json.loads(res.content)
+        summary = parse_critic_output(res.content, "Language Critic")
+
+        # Create Critique object
+        critique = Critique(
+            source="Language Critic",
+            summary=summary,
+            details=data,
+            resolved=False
+        )
+
+        return {"critique_inputs": [critique]}
+    except json.JSONDecodeError as e:
+        print(f"❌ Language Critic JSON Error: {e}")
+        print(f"Response content: {res.content[:200]}")
+        error_critique = Critique(
+            source="Language Critic",
+            summary=f"### Error\nFailed to parse JSON: {str(e)}",
+            details={"error": str(e), "raw_response": res.content[:500]},
+            resolved=False
+        )
+        return {"critique_inputs": [error_critique]}
 
 def impact_critic_node(state: AgentState):
     # This one has a slightly different JSON structure, so we parse it custom or adapt the helper
     res = llm.invoke(impact_prompt.invoke({"resume_text": state["resume_text"]}))
-    
+
     # Custom parsing for the complex Impact JSON
     try:
         data = json.loads(res.content)
@@ -180,6 +279,22 @@ def impact_critic_node(state: AgentState):
         for item in data.get("critique_feedback", []):
             summary += f"- **Original:** {item['original_bullet']}\n"
             summary += f"  - *Fix:* {item['star_rewrite']}\n"
-        return {"critique_feedback": [summary]}
-    except:
-        return {"critique_feedback": ["Error parsing Impact Report"]}
+
+        # Create Critique object
+        critique = Critique(
+            source="Impact Critic",
+            summary=summary,
+            details=data,
+            resolved=False
+        )
+
+        return {"critique_inputs": [critique]}
+    except Exception as e:
+        # Error handling - return error critique
+        error_critique = Critique(
+            source="Impact Critic",
+            summary=f"### Error parsing Impact Report\n{str(e)}",
+            details={"error": str(e)},
+            resolved=False
+        )
+        return {"critique_inputs": [error_critique]}

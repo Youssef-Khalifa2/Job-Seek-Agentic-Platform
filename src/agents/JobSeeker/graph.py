@@ -1,14 +1,14 @@
 from langgraph.graph import StateGraph, START, END
-from src.agents.job_seeker.state import AgentState
+from src.agents.JobSeeker.state import AgentState
 
 # Import Nodes
-from src.agents.job_seeker.supervisor import supervisor_node
-from src.agents.job_seeker.critics import (
+from src.agents.JobSeeker.supervisor import supervisor_node
+from src.agents.JobSeeker.critics import (
     ats_critic_node, match_critic_node, truth_critic_node, 
     language_critic_node, impact_critic_node
 )
-from src.agents.job_seeker.consolidator import consolidator_node
-from src.agents.job_seeker.editor import editor_node
+from src.agents.JobSeeker.consolidator import consolidator_node
+from src.agents.JobSeeker.editor import editor_node
 
 def passthrough(state):
     return {} # Dummy node for splitting
@@ -34,7 +34,7 @@ def build_job_seeker_graph():
     
     # A. Start -> Supervisor (Decides if we need to edit)
     workflow.add_edge(START, "supervisor")
-    
+
     # C. The Fan-Out (Parallel Execution) 🌬️
     # From the splitter to ALL 5 critics
     workflow.add_edge("critics_start", "ats_critic")
@@ -56,3 +56,5 @@ def build_job_seeker_graph():
     workflow.add_edge("editor", "supervisor")     # Edit -> Check Revisions (Loop)
 
     return workflow.compile()
+
+

@@ -1,6 +1,7 @@
 import os
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
+from src.database.schema import create_collection_if_not_exists
 
 class VectorDBClient:
     """
@@ -11,6 +12,7 @@ class VectorDBClient:
         port = int(os.getenv("QDRANT_PORT", 6333))
         
         self.client = QdrantClient(host=host, port=port)
+        create_collection_if_not_exists(self.client, 768)
         print(f"🔌 Connected to Qdrant at {host}:{port}")
 
     def upsert(self, collection_name, points):

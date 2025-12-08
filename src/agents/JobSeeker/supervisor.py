@@ -1,6 +1,6 @@
 from typing import Literal
 from langgraph.types import Command
-from src.agents.job_seeker.state import AgentState
+from src.agents.JobSeeker.state import AgentState
 
 def supervisor_node(state: AgentState) -> Command[Literal["critics_start", "__end__"]]:
     """
@@ -24,3 +24,6 @@ def supervisor_node(state: AgentState) -> Command[Literal["critics_start", "__en
     # We target "critics_start" because that is the name of our 
     # splitter node in graph.py
     return Command(goto="critics_start")
+
+
+    

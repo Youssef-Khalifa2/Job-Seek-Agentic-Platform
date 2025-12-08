@@ -1,6 +1,6 @@
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_aws import ChatAWSBedrock
-from src.agents.job_seeker.state import AgentState
+from langchain_aws import ChatBedrock
+from src.agents.JobSeeker.state import AgentState
 import config
 from src.utils import filter_reasoning
 
@@ -40,9 +40,7 @@ def editor_node(state: AgentState):
     feedback_str = ""
     for c in state["actionable_critiques"]:
         feedback_str += f"- {c.summary}\n"
-        # We could add c.details here if we want the Editor to see the raw JSON
     
-    # 2. Invoke the Editor
     msg = editor_prompt.invoke({
         "resume_text": state["resume_text"],
         "critiques_list": feedback_str
@@ -50,11 +48,10 @@ def editor_node(state: AgentState):
     
     response = llm.invoke(msg)
 
-    response = filter_reasoning(response)
-    
-    # 3. Update the State
+    filtered_content = filter_reasoning(response)
+
     return {
-        "resume_text": response.content,           # The new CV!
+        "resume_text": filtered_content,          
         "revision_count": state["revision_count"] + 1,
-        "actionable_critiques": []                 # Clear the to-do list for the next round
+        "actionable_critiques": []                 
     }

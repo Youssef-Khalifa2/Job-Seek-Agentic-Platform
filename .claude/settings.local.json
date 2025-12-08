@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "WebSearch",
+      "WebFetch(domain:aws.amazon.com)",
+      "WebFetch(domain:docs.mistral.ai)",
+      "WebFetch(domain:mistral.ai)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
