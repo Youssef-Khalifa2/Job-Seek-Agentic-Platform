@@ -1,7 +1,7 @@
 # File: src/agents/JobSeeker/state.py
 import operator
 import uuid
-from typing import Annotated, List, TypedDict, Union, Dict, Any, Optional, Set
+from typing import Annotated, List, TypedDict, Union, Dict, Any, Optional
 from langchain_core.messages import BaseMessage
 from pydantic import BaseModel, Field
 
@@ -22,26 +22,30 @@ class AgentState(TypedDict):
     """
     messages : Annotated[List[BaseMessage], operator.add]
     critique_inputs: Annotated[List[Critique], operator.add]
-    resolved_critique_ids: Set[str]
+    resolved_critique_ids: List[str]  # Changed from Set[str] - Sets aren't JSON serializable
     refined_cv_text: str  # Note: You might want to unify this with resume_text eventually
-    revision_count: int
+    revision_count: Optional[int]  # Made Optional with default 0
     next_node: Optional[str]
     job_description: Optional[str]
     resume_text: Optional[str]
-    actionable_critiques: List[Critique]
-    
+    actionable_critiques: List[Critique]  # No annotation = replace on update (correct behavior)
+
     # --- NEW: Quality Tracking ---
-    quality_scores: List[float]  # Track quality over iterations [75.0, 80.5, ...]
-    revision_history: List[Dict[str, Any]]  # Track what changed
-    
+    quality_scores: Optional[List[float]]  # Made Optional with default []
+    revision_history: Optional[List[Dict[str, Any]]]  # Made Optional with default []
+
     # --- NEW: Tool Context ---
     original_pdf_path: Optional[str]  # Needed for Vision Model
     ats_parser_result: Optional[Dict[str, Any]]
     layout_analysis: Optional[Dict[str, Any]]
-    
+
     # --- NEW: Verification & Retry Logic ---
-    editor_retry_count: int  # Track retries within one loop
-    max_editor_retries: int  # Default e.g. 2
-    unresolved_critiques: List[Dict[str, Any]]  # Critiques the editor failed to fix
+    editor_retry_count: Optional[int]  # Made Optional with default 0
+    max_editor_retries: Optional[int]  # Made Optional with default 2
+    unresolved_critiques: Optional[List[Dict[str, Any]]]  # Made Optional
     verification_result: Optional[Dict[str, Any]]
     retry_guidance: Optional[str]  # Summary of what verifier wants editor to focus on
+
+    # --- NEW: User Input Request ---
+    needs_user_input: Optional[bool]  # Flag to pause workflow for user input
+    user_input_request: Optional[Dict[str, Any]]  # What to ask the user for

@@ -72,5 +72,5 @@ def render_to_png(graph, output_path: str = "graph.png"):
         return False
 
 if __name__ == "__main__":
-    run_test()
-    #render_to_png(build_job_seeker_graph())
+    #run_test()
+    render_to_png(build_job_seeker_graph())

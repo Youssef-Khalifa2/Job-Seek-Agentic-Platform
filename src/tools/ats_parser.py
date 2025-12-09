@@ -45,4 +45,49 @@ class ATSParser:
 
 # Helper for the Agent
 def check_ats_compatibility(pdf_path: str) -> Dict[str, Any]:
+    """
+    Check ATS compatibility with PDF validation.
+    """
+    # Validate PDF file before parsing
+    if not pdf_path:
+        return {
+            "parsable_status": False,
+            "errors": ["No PDF path provided"],
+            "warnings": [],
+            "extracted_sections": {},
+            "confidence": 0.0
+        }
+
+    if not os.path.exists(pdf_path):
+        return {
+            "parsable_status": False,
+            "errors": ["PDF file not found"],
+            "warnings": [],
+            "extracted_sections": {},
+            "confidence": 0.0
+        }
+
+    if not pdf_path.lower().endswith('.pdf'):
+        return {
+            "parsable_status": False,
+            "errors": ["File is not a PDF"],
+            "warnings": [],
+            "extracted_sections": {},
+            "confidence": 0.0
+        }
+
+    # Check file is readable
+    try:
+        with open(pdf_path, 'rb') as f:
+            f.read(1)  # Try to read first byte
+    except Exception as e:
+        return {
+            "parsable_status": False,
+            "errors": [f"File not readable: {str(e)}"],
+            "warnings": [],
+            "extracted_sections": {},
+            "confidence": 0.0
+        }
+
+    # Validation passed, proceed with parsing
     return ATSParser.parse_resume(pdf_path)

@@ -18,3 +18,5 @@ pyresparser
 nltk
 spacy
 duckduckgo-search
+markdown
+weasyprint

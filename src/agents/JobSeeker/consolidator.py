@@ -57,9 +57,17 @@ def consolidator_node(state: AgentState):
         if c.id not in resolved_ids
     ]
 
+    # Check if we're in retry mode
+    retry_mode = state.get("editor_retry_count", 0) > 0
+
     if not unresolved_critiques:
-        print("  ✨ No new critiques to process.")
-        return {"actionable_critiques": []}
+        if not retry_mode:
+            print("  ✨ No new critiques to process.")
+            return {"actionable_critiques": []}
+        else:
+            # During retry, keep existing critiques
+            print("  ℹ️ No new critiques, but in retry mode - keeping existing critiques")
+            return {}  # Return empty dict to not update actionable_critiques
 
     # 3. Pass to LLM
     raw_inputs = [c.model_dump() for c in unresolved_critiques]
@@ -89,13 +97,11 @@ def consolidator_node(state: AgentState):
 
         print(f"  ✅ Consolidator produced {len(new_actionables)} actionable items")
 
-        # Mark inputs as processed
-        newly_resolved_ids = {c.id for c in unresolved_critiques}
-        updated_resolved_ids = resolved_ids.union(newly_resolved_ids)
-
+        # DON'T mark as resolved yet - verifier will do that after confirming editor's work
+        # Keep resolved IDs as-is
         return {
             "actionable_critiques": new_actionables,
-            "resolved_critique_ids": updated_resolved_ids
+            "resolved_critique_ids": resolved_ids  # No change - verifier handles resolution
         }
 
     except Exception as e:

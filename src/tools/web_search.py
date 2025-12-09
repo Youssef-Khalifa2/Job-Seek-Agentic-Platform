@@ -2,6 +2,7 @@ from langchain_community.tools import DuckDuckGoSearchRun
 from src.llm_registry import LLMRegistry
 from typing import List, Dict, Any
 import json
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 class JobMarketResearch:
     """
@@ -64,7 +65,11 @@ class JobMarketResearch:
         query = f'"{job_title}" job requirements "{skill}"'
 
         try:
-            results = self.search.run(query)
+            # Use ThreadPoolExecutor with timeout to prevent hanging
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(self.search.run, query)
+                results = future.result(timeout=10)  # 10 second timeout
+
             # Simple heuristic: how often is the skill mentioned in the snippets?
             skill_mentions = results.lower().count(skill.lower())
 
@@ -73,6 +78,14 @@ class JobMarketResearch:
                 "validated": skill_mentions > 0,
                 "mentions": skill_mentions,
                 "evidence_snippet": results[:200] + "..."
+            }
+        except TimeoutError:
+            print(f"  ⏱️ Web search timeout for skill: {skill}")
+            return {
+                "skill": skill,
+                "validated": False,
+                "error": "Search timeout (10s)",
+                "mentions": 0
             }
         except Exception as e:
             return {"skill": skill, "validated": False, "error": str(e)}

@@ -43,9 +43,17 @@ class LayoutAnalyzer:
         Main method called by the Agent.
         """
         images = self._pdf_to_images(pdf_path)
-        
+
         if not images:
-            return {"error": "Could not convert PDF to images", "parsable": False}
+            return {
+                "has_columns": False,
+                "has_graphics": False,
+                "has_tables": False,
+                "overall_score": 0,
+                "layout_issues": ["Error: Could not convert PDF to images"],
+                "recommendation": "Unable to analyze layout",
+                "error": "Could not convert PDF to images"
+            }
 
         # Construct the VLM prompt
         content_payload = [
@@ -98,7 +106,15 @@ class LayoutAnalyzer:
 
         except Exception as e:
             print(f"❌ VLM Analysis failed: {e}")
-            return {"error": str(e), "layout_issues": []}
+            return {
+                "has_columns": False,
+                "has_graphics": False,
+                "has_tables": False,
+                "overall_score": 0,
+                "layout_issues": [f"Error: {str(e)}"],
+                "recommendation": "Unable to analyze layout",
+                "error": str(e)
+            }
 
 # Helper for the Agent
 def analyze_resume_layout(pdf_path: str) -> Dict[str, Any]:

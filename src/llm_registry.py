@@ -50,7 +50,7 @@ class LLMRegistry:
         )
 
     @staticmethod
-    def get_gpt_oss():
+    def get_gpt_oss120():
         """GPT-OSS-120B - Strong instruction following for editing ($1.00/1M)."""
         return ChatBedrock(
             model_id="openai.gpt-oss-120b-1:0",
@@ -58,6 +58,39 @@ class LLMRegistry:
             aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY,
             region_name=config.AWS_REGION,
             model_kwargs={"temperature": 0.5, "max_tokens": 8192}
+        )
+
+    @staticmethod
+    def get_gpt_oss20():
+        """GPT-OSS-120B - Strong instruction following for editing ($1.00/1M)."""
+        return ChatBedrock(
+            model_id="openai.gpt-oss-20b-1:0",
+            aws_access_key_id=config.AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY,
+            region_name=config.AWS_REGION,
+            model_kwargs={"temperature": 0.5, "max_tokens": 8192}
+        )
+
+    @staticmethod
+    def get_nova_pro():
+        """Amazon Nova Pro - Strong instruction following for editing ($1.00/1M)."""
+        return ChatBedrock(
+            model_id="amazon.nova-pro-v1:0",
+            aws_access_key_id=config.AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY,
+            region_name=config.AWS_REGION,
+            model_kwargs={"temperature": 0.5, "max_tokens": 8192}
+        )
+    
+    @staticmethod
+    def get_deepseek_v3():
+        """DeepSeek V3 - Strong instruction following for editing ($1.00/1M)."""
+        return ChatBedrock(
+            model_id="deepseek.v3-v1:0",
+            aws_access_key_id=config.AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY,
+            region_name=config.AWS_REGION,
+            model_kwargs={"temperature": 0.2, "max_tokens": 2048}
         )
 
     @staticmethod
@@ -90,6 +123,7 @@ class LLMRegistry:
             response_format={"type": "json_object"},
             temperature=0.3
         )
+
     
     @staticmethod
     def get_mistral_medium():
